@@ -1,0 +1,9 @@
+{
+  "products": [
+    {
+      "offer_id": "id",
+      "name": "name",
+      "description": "description"
+    }
+  ]
+}

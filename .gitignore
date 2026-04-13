@@ -1,0 +1,34 @@
+# Секреты и конфиг окружения
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.claude
+
+# Виртуальное окружение
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
+
+# Логи (сам файл, но не папку)
+logs/*.log
+
+# Скриншоты и временные файлы агента
+root/
