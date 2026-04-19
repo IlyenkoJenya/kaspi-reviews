@@ -2,12 +2,14 @@
 import asyncio
 import random
 import re
+from datetime import datetime
 
 from aiogram import Router, F, Bot
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     Message,
+    CallbackQuery,
     ReplyKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardRemove,
@@ -17,7 +19,6 @@ from bot.states import ReviewFlow
 from agent.session import ReviewSession
 from product_manager import (
     get_all_products,
-    get_offer_ids,
     get_product_by_offer_id,
     add_product,
     remove_product,
@@ -26,7 +27,15 @@ from product_manager import (
 from config import ALLOWED_CHATS, OWNER_ID
 
 router = Router()
-active_sessions: dict[int, ReviewSession] = {}
+
+# Одна глобальная сессия — только один мастер за раз
+_global_session: ReviewSession | None = None
+_global_owner_id: int | None = None
+_global_owner_name: str = ""
+_global_started_at: datetime | None = None
+
+# FSMContext владельца сессии — нужен владельцу для force-cancel
+_global_owner_state: FSMContext | None = None
 
 REVIEW_TRIGGER = re.compile(
     r"(сделай\s+отзыв|нужен\s+отзыв|запусти\s+отзыв|сделать\s+отзыв|"
@@ -38,30 +47,58 @@ CANCEL_TRIGGER = re.compile(
     re.IGNORECASE,
 )
 
+STAGE_MSGS = {
+    "init":        "Агент ещё не успел изменить цену.",
+    "price_set":   "Цена была снижена до 100 ₸ — агент вернёт её обратно.",
+    "order_found": "Заказ найден — агент вернёт цену.",
+    "sms_sent":    "SMS уже отправлен. Агент завершит выдачу и вернёт цену.",
+    "done":        "Сессия уже завершена.",
+}
 
-def is_allowed(message):
+STAGE_LABELS = {
+    "init":        "Логин / инициализация",
+    "price_set":   "Цена снижена, жду заказ",
+    "order_found": "Заказ найден, жду подтверждения",
+    "sms_sent":    "SMS отправлен, жду код",
+    "done":        "Завершено",
+}
+
+
+def is_allowed(message: Message) -> bool:
     if not ALLOWED_CHATS or ALLOWED_CHATS == [0]:
         return True
     return message.chat.id in ALLOWED_CHATS
 
 
-def is_owner(message):
+def is_owner(message: Message) -> bool:
     if OWNER_ID == 0:
         return True
     return message.from_user.id == OWNER_ID
 
 
-def get_session_key(message):
-    return message.from_user.id
+def _can_cancel(message: Message) -> bool:
+    """Может отменить сессию: владелец бота или тот, кто её запустил."""
+    return is_owner(message) or message.from_user.id == _global_owner_id
+
+
+def _get_user_name(message: Message) -> str:
+    user = message.from_user
+    return user.first_name or user.username or "Мастер"
+
+
+def _elapsed_str() -> str:
+    if not _global_started_at:
+        return ""
+    minutes = int((datetime.now() - _global_started_at).total_seconds() // 60)
+    return f" ({minutes} мин. назад)" if minutes > 0 else ""
 
 
 async def make_notify(bot: Bot, chat_id: int, thread_id: int | None = None):
-    """Отправляет сообщения агента БЕЗ parse_mode — избегаем конфликтов с Markdown."""
-    async def notify(uid: int, text: str):
+    async def notify(uid: int, text: str, reply_markup=None):
         await bot.send_message(
             chat_id,
             text,
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=reply_markup if reply_markup is not None else ReplyKeyboardRemove(),
             message_thread_id=thread_id,
         )
     return notify
@@ -71,17 +108,20 @@ async def make_notify(bot: Bot, chat_id: int, thread_id: int | None = None):
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer(
-        "Привет! Я бот AQUASOFT для автоматизации отзывов в Kaspi.\n\n"
-        "Напиши сделай отзыв — запущу процесс.\n"
-        "Отмена в любой момент: отмени отзыв или /cancel\n\n"
-        "Команды мастера:\n"
-        "/list_products — список товаров\n"
-        "/status — статус твоей сессии\n"
-        "/cancel — отменить сессию\n\n"
-        "Команды владельца:\n"
+    owner_commands = (
+        "\n\nКоманды владельца:\n"
         "/add_product <offer_id> <название>\n"
-        "/remove_product <offer_id>",
+        "/remove_product <offer_id>"
+    ) if is_owner(message) else ""
+
+    await message.answer(
+        "👋 Привет! Я автоматизирую получение отзывов в Kaspi.\n\n"
+        "Чтобы начать — напиши «сделай отзыв»\n"
+        "Отмена — «отмени отзыв» или /cancel\n\n"
+        "📋 Команды:\n"
+        "/list_products — список товаров\n"
+        "/status — статус текущей сессии"
+        f"{owner_commands}",
     )
 
 
@@ -99,7 +139,7 @@ async def cmd_add_product(message: Message):
     if not is_allowed(message):
         return
     if not is_owner(message):
-        await message.answer("Только владелец может добавлять товары.")
+        await message.answer("❌ Только владелец может добавлять товары.")
         return
     parts = message.text.strip().split(maxsplit=2)
     if len(parts) < 2:
@@ -118,7 +158,7 @@ async def cmd_remove_product(message: Message):
     if not is_allowed(message):
         return
     if not is_owner(message):
-        await message.answer("Только владелец может удалять товары.")
+        await message.answer("❌ Только владелец может удалять товары.")
         return
     parts = message.text.strip().split(maxsplit=1)
     if len(parts) < 2:
@@ -136,72 +176,78 @@ async def cmd_remove_product(message: Message):
 async def handle_cancel_phrase(message: Message, state: FSMContext):
     if not is_allowed(message):
         return
-    user_id = get_session_key(message)
-    session = active_sessions.get(user_id)
-    if not session:
-        await message.answer("Нет активной сессии для отмены.")
+
+    if not _global_session:
+        await message.answer("Нет активной сессии.")
         return
-    stage = session.cancel()
-    msgs = {
-        "init":        "Агент ещё не успел изменить цену.",
-        "price_set":   "Цена была снижена до 100 тг — агент вернёт её обратно.",
-        "order_found": "Заказ найден — агент вернёт цену.",
-        "sms_sent":    "SMS уже отправлен. Агент завершит выдачу и вернёт цену.",
-        "done":        "Сессия уже завершена.",
-    }
-    await state.clear()
-    active_sessions.pop(user_id, None)
-    await message.answer(
-        f"Сессия отменяется...\n{msgs.get(stage, '')}\n\nАгент возвращает всё на место...",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+
+    if not _can_cancel(message):
+        await message.answer(
+            f"⏳ Сессию ведёт {_global_owner_name} — только он или владелец могут её отменить."
+        )
+        return
+
+    await _do_cancel(message, state)
 
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
-    user_id = get_session_key(message)
-    session = active_sessions.pop(user_id, None)
-    if session:
-        stage = session.cancel()
-        msgs = {
-            "init":        "Агент ещё не успел изменить цену.",
-            "price_set":   "Цена снижена до 100 тг — агент вернёт обратно.",
-            "order_found": "Заказ найден — агент вернёт цену.",
-            "sms_sent":    "SMS уже отправлен. Агент завершит и вернёт цену.",
-            "done":        "Уже завершено.",
-        }
+    if not _global_session:
+        await message.answer("Нет активной сессии.", reply_markup=ReplyKeyboardRemove())
+        await state.clear()
+        return
+
+    if not _can_cancel(message):
         await message.answer(
-            f"Сессия отменена.\n{msgs.get(stage, '')}",
+            f"⏳ Сессию ведёт {_global_owner_name} — только он или владелец могут её отменить.",
             reply_markup=ReplyKeyboardRemove(),
         )
-    else:
-        await message.answer("Нет активной сессии.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    await _do_cancel(message, state)
+
+
+async def _do_cancel(message: Message, state: FSMContext):
+    """Общая логика отмены сессии."""
+    global _global_session, _global_owner_id, _global_owner_name, _global_started_at, _global_owner_state
+
+    session = _global_session
+    owner_state = _global_owner_state
+    by_owner = is_owner(message) and message.from_user.id != _global_owner_id
+
+    stage = session.cancel()
+
+    # Сбрасываем состояние того, кто запустил (если отменяет владелец — у него другой state)
+    if owner_state is not None and by_owner:
+        await owner_state.clear()
     await state.clear()
+
+    who = f" (отменено владельцем)" if by_owner else ""
+    await message.answer(
+        f"🚫 Сессия {_global_owner_name} отменена{who}.\n"
+        f"{STAGE_MSGS.get(stage, '')}\n\n"
+        f"Возвращаю всё на место...",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 # ── /status ───────────────────────────────────────────────────────────────────
 
 @router.message(Command("status"))
 async def cmd_status(message: Message):
-    user_id = get_session_key(message)
-    session = active_sessions.get(user_id)
-    if not session:
-        await message.answer("У тебя нет активной сессии.")
+    if not _global_session:
+        await message.answer("Нет активной сессии.")
         return
-    labels = {
-        "init":        "Логин / инициализация",
-        "price_set":   "Цена снижена, жду заказ",
-        "order_found": "Заказ найден, жду подтверждения",
-        "sms_sent":    "SMS отправлен, жду код",
-        "done":        "Завершено",
-    }
-    old_price = session._old_price_ref
-    price_info = f"\nОригинальная цена: {old_price} тг" if old_price else ""
-    offer = session._offer_id_ref or "—"
+
+    old_price = _global_session._old_price_ref
+    price_info = f"\n💰 Оригинальная цена: {old_price} ₸" if old_price else ""
+    offer = _global_session._offer_id_ref or "—"
+
     await message.answer(
-        f"Статус сессии:\n"
-        f"Товар: {offer}\n"
-        f"Стадия: {labels.get(session._current_stage, session._current_stage)}"
+        f"📊 Текущая сессия:\n"
+        f"👤 Мастер: {_global_owner_name}{_elapsed_str()}\n"
+        f"📦 Товар: {offer}\n"
+        f"🔄 Статус: {STAGE_LABELS.get(_global_session._current_stage, _global_session._current_stage)}"
         f"{price_info}"
     )
 
@@ -212,16 +258,19 @@ async def cmd_status(message: Message):
 async def cmd_start_review(message: Message, state: FSMContext):
     if not is_allowed(message):
         return
-    user_id = get_session_key(message)
-    if user_id in active_sessions:
-        await message.answer("У тебя уже есть активная сессия. Для отмены: /cancel")
-        return
-    products = get_all_products()
-    if not products:
-        await message.answer("Список товаров пуст! Владелец должен добавить товар.")
+
+    if _global_session is not None:
+        await message.answer(
+            f"⏳ {_global_owner_name} уже ведёт сессию{_elapsed_str()}.\n\n"
+            f"Дождись завершения или попроси владельца отменить."
+        )
         return
 
-    # Кнопки с номерами товаров
+    products = get_all_products()
+    if not products:
+        await message.answer("Список товаров пуст. Владелец должен добавить товар.")
+        return
+
     kb_rows = []
     row = []
     for i in range(1, len(products) + 1):
@@ -237,10 +286,10 @@ async def cmd_start_review(message: Message, state: FSMContext):
     await state.set_state(ReviewFlow.waiting_product)
     await state.update_data(chat_id=message.chat.id, thread_id=message.message_thread_id)
 
-    lines = [f"Выбери товар по номеру:"]
+    lines = ["Выбери товар по номеру:\n"]
     for i, p in enumerate(products, 1):
         lines.append(f"{i}. {p['name']}")
-    lines.append("\nИли нажми пропустить для случайного")
+    lines.append("\nИли нажми «пропустить» — выберу случайный")
     await message.answer("\n".join(lines), reply_markup=kb)
 
 
@@ -248,15 +297,27 @@ async def cmd_start_review(message: Message, state: FSMContext):
 
 @router.message(ReviewFlow.waiting_product)
 async def handle_product(message: Message, state: FSMContext, bot: Bot):
+    global _global_session, _global_owner_id, _global_owner_name, _global_started_at, _global_owner_state
+
+    # Повторная проверка — пока выбирал товар, кто-то мог стартануть
+    if _global_session is not None:
+        await state.clear()
+        await message.answer(
+            f"⏳ {_global_owner_name} успел запустить сессию пока ты выбирал товар.\n"
+            f"Дождись завершения.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
     text      = message.text.strip()
     data      = await state.get_data()
     chat_id   = data.get("chat_id", message.chat.id)
     thread_id = data.get("thread_id")
-    user_id   = get_session_key(message)
+    user_id   = message.from_user.id
     products  = get_all_products()
-    offer_ids = [p["offer_id"] for p in products]
 
     if text.lower() == "пропустить":
+        offer_ids = [p["offer_id"] for p in products]
         if not offer_ids:
             await message.answer("Список товаров пуст.")
             await state.clear()
@@ -273,14 +334,18 @@ async def handle_product(message: Message, state: FSMContext, bot: Bot):
 
     notify  = await make_notify(bot, chat_id, thread_id)
     session = ReviewSession(user_id, notify)
-    active_sessions[user_id] = session
+
+    _global_session     = session
+    _global_owner_id    = user_id
+    _global_owner_name  = _get_user_name(message)
+    _global_started_at  = datetime.now()
+    _global_owner_state = state
 
     await state.set_state(ReviewFlow.waiting_confirm)
     await message.answer(
-        f"Запускаю агента...\n"
-        f"Товар: {product_name}\n"
-        f"{offer_id}\n\n"
-        f"Для отмены: отмени отзыв или /cancel",
+        f"⚙️ Запускаю агента...\n"
+        f"📦 Товар: {product_name}\n\n"
+        f"Для отмены — «отмени отзыв» или /cancel",
         reply_markup=ReplyKeyboardRemove(),
     )
     asyncio.create_task(
@@ -288,58 +353,104 @@ async def handle_product(message: Message, state: FSMContext, bot: Bot):
     )
 
 
-# ── Шаг 3: подтверждение заказа ──────────────────────────────────────────────
+# ── Шаг 3: подтверждение заказа — inline-кнопки ──────────────────────────────
+
+@router.callback_query(F.data == "order:yes")
+async def cb_order_yes(call: CallbackQuery, state: FSMContext):
+    if _global_session is None:
+        await call.answer("Сессия уже завершена.", show_alert=True)
+        return
+    if call.from_user.id != _global_owner_id:
+        await call.answer(
+            f"Это сессия {_global_owner_name} — только он может ответить.",
+            show_alert=True,
+        )
+        return
+    await call.answer()
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer("✅ Подтверждено! Ожидай SMS от клиента...")
+    await state.set_state(ReviewFlow.waiting_sms)
+    await _global_session.order_confirm_queue.put("yes")
+
+
+@router.callback_query(F.data == "order:no")
+async def cb_order_no(call: CallbackQuery, state: FSMContext):
+    if _global_session is None:
+        await call.answer("Сессия уже завершена.", show_alert=True)
+        return
+    if call.from_user.id != _global_owner_id:
+        await call.answer(
+            f"Это сессия {_global_owner_name} — только он может ответить.",
+            show_alert=True,
+        )
+        return
+    await call.answer()
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer("❌ Клиент не подтверждён. Возвращаю цену...")
+    await state.clear()
+    await _global_session.order_confirm_queue.put("no")
+
+
+# ── Шаг 3: подтверждение заказа — текст (fallback) ───────────────────────────
 
 @router.message(ReviewFlow.waiting_confirm, F.text.lower().in_(["да", "yes", "✅", "+"]))
 async def confirm_order_yes(message: Message, state: FSMContext):
-    user_id = get_session_key(message)
-    session = active_sessions.get(user_id)
-    if not session:
+    if not _global_session:
         await message.answer("Сессия не найдена.")
         return
-    await message.answer("Подтверждено. Ожидай SMS-код от клиента...", reply_markup=ReplyKeyboardRemove())
+    await message.answer("✅ Подтверждено! Ожидай SMS от клиента...", reply_markup=ReplyKeyboardRemove())
     await state.set_state(ReviewFlow.waiting_sms)
-    await session.order_confirm_queue.put("yes")
+    await _global_session.order_confirm_queue.put("yes")
 
 
 @router.message(ReviewFlow.waiting_confirm, F.text.lower().in_(["нет", "no", "❌", "-"]))
 async def confirm_order_no(message: Message, state: FSMContext):
-    user_id = get_session_key(message)
-    session = active_sessions.get(user_id)
-    if session:
-        await session.order_confirm_queue.put("no")
+    if _global_session:
+        await _global_session.order_confirm_queue.put("no")
     await state.clear()
-    active_sessions.pop(user_id, None)
-    await message.answer("Отменено. Цену возвращаю.", reply_markup=ReplyKeyboardRemove())
+    await message.answer("❌ Клиент не подтверждён. Возвращаю цену...", reply_markup=ReplyKeyboardRemove())
 
 
-# SMS-код написан ДО перехода в waiting_sms (заранее)
+# Мастер написал SMS-код раньше времени
 @router.message(ReviewFlow.waiting_confirm, F.text.regexp(r"^\d{4}$"))
 async def handle_sms_code_early(message: Message):
-    user_id = get_session_key(message)
-    session = active_sessions.get(user_id)
-    if not session:
+    if not _global_session:
         return
-    await session.sms_code_queue.put(message.text.strip())
-    await message.answer("Код принят! Подожди — сначала нужно подтвердить заказ.\nОтветь да или нет на вопрос выше.")
+    await _global_session.sms_code_queue.put(message.text.strip())
+    await message.answer("📥 Код принят! Сначала ответь «да» или «нет» на вопрос выше.")
+
+
+# Неожиданный ввод в waiting_confirm
+@router.message(ReviewFlow.waiting_confirm)
+async def confirm_unknown(message: Message):
+    await message.answer("Ответь «да» или «нет» 👆")
 
 
 # ── Шаг 4: SMS-код ───────────────────────────────────────────────────────────
 
 @router.message(ReviewFlow.waiting_sms, F.text.regexp(r"^\d{4}$"))
 async def handle_sms_code(message: Message):
-    user_id = get_session_key(message)
-    session = active_sessions.get(user_id)
-    if not session:
+    if not _global_session:
         await message.answer("Сессия не найдена.")
         return
-    await message.answer("Ввожу код в Kaspi...", reply_markup=ReplyKeyboardRemove())
-    await session.sms_code_queue.put(message.text.strip())
+    await message.answer("⌨️ Ввожу код в Kaspi...", reply_markup=ReplyKeyboardRemove())
+    await _global_session.sms_code_queue.put(message.text.strip())
 
 
 @router.message(ReviewFlow.waiting_sms)
 async def handle_sms_wrong(message: Message):
-    await message.answer("Код должен быть ровно 4 цифры. Попробуй ещё раз:")
+    await message.answer("Код — ровно 4 цифры. Попробуй ещё раз:")
+
+
+# ── Ловим "да/нет" от мастеров не в FSM-состоянии ───────────────────────────
+
+@router.message(F.text.lower().in_(["да", "нет", "yes", "no", "✅", "❌", "+", "-"]))
+async def handle_yes_no_busy(message: Message):
+    if _global_session is not None:
+        await message.answer(
+            f"⏳ {_global_owner_name} ведёт сессию{_elapsed_str()}.\n"
+            f"Дождись завершения."
+        )
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────
@@ -352,8 +463,13 @@ async def _run_session_and_cleanup(
     user_id: int,
     state: FSMContext,
 ):
+    global _global_session, _global_owner_id, _global_owner_name, _global_started_at, _global_owner_state
     try:
         await session.start(offer_id, product_name, product_desc)
     finally:
-        active_sessions.pop(user_id, None)
+        _global_session     = None
+        _global_owner_id    = None
+        _global_owner_name  = ""
+        _global_started_at  = None
+        _global_owner_state = None
         await state.clear()

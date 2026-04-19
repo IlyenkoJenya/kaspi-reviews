@@ -1,8 +1,37 @@
+# agent/session.py
+#
+# Улучшения v3:
+#
+# 1. ГАРАНТИРОВАННЫЙ ВОЗВРАТ ЦЕНЫ
+#    - _safe_restore_price(): 3 попытки с паузой, с проверкой результата
+#    - Вызывается в finally — при ЛЮБОМ выходе из флоу
+#    - Если страница упала — _restore_price_new_browser() открывает новый браузер
+#    - Если всё провалилось — мастер получает данные для ручного возврата со ссылкой
+#
+# 2. SMS-КОД В ЛЮБОЙ МОМЕНТ
+#    - sms_code_queue буферизует код — мастер может написать его заранее
+#    - handlers.py принимает 4 цифры и в waiting_sms, и в waiting_confirm
+#
+# 3. ТАЙМАУТ С УВЕДОМЛЕНИЕМ
+#    - Все таймауты сопровождаются сообщением мастеру
+#    - После таймаута всегда пытаемся вернуть цену
+#
+# 4. ФЛАГ _price_changed
+#    - Возврат цены происходит только если цена реально была изменена
+#    - Снимается после успешного возврата — нет двойных попыток
+
 import asyncio
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from playwright.sync_api import sync_playwright
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# Inline-клавиатура подтверждения заказа
+CONFIRM_KB = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="✅ Да", callback_data="order:yes"),
+    InlineKeyboardButton(text="❌ Нет", callback_data="order:no"),
+]])
 
 from agent.kaspi_login import login
 from agent.kaspi_actions import (
@@ -31,6 +60,7 @@ class ReviewSession:
         self.notify   = notify_callback
         self.loop     = asyncio.get_event_loop()
 
+        # Очереди бот → агент
         self.order_confirm_queue = asyncio.Queue()
         self.sms_code_queue      = asyncio.Queue()  # буферизует код даже если написан заранее
 
@@ -38,10 +68,14 @@ class ReviewSession:
         self._current_stage = "init"
         self._offer_id_ref  = None
         self._old_price_ref = None
-        self._price_changed = False
+        self._price_changed = False  # True если цена была снижена и требует возврата
 
         self._product_name  = ""
         self._product_desc  = ""
+
+    # ──────────────────────────────────────────────────────────────────────
+    # PUBLIC
+    # ──────────────────────────────────────────────────────────────────────
 
     async def start(self, offer_id: str, product_name: str = "", product_desc: str = ""):
         self._product_name = product_name
@@ -62,7 +96,12 @@ class ReviewSession:
     def is_cancelled(self) -> bool:
         return self._cancel_event.is_set()
 
+    # ──────────────────────────────────────────────────────────────────────
+    # MAIN
+    # ──────────────────────────────────────────────────────────────────────
+
     def _run_sync(self, offer_id: str):
+        """Верхний уровень: запускает браузер и ловит его падение."""
         self._offer_id_ref = offer_id
         page = None
 
@@ -76,38 +115,51 @@ class ReviewSession:
                 self._main_flow(page, offer_id)
 
         except Exception as e:
+            # Браузер упал совсем — пробуем вернуть цену в новом браузере
             print(f"❌ Браузер упал: {e}")
             if self._price_changed and self._old_price_ref is not None:
                 self._notify_sync("⚠️ Браузер упал. Открываю новый сеанс для возврата цены...")
                 self._restore_price_new_browser(offer_id, self._old_price_ref)
 
     def _main_flow(self, page, offer_id: str):
+        """
+        Основной флоу сессии.
+        Возврат цены гарантирован через finally.
+        """
         old_price = None
 
         try:
+            # ── 1. ЛОГИН ──────────────────────────────────────────────────
             self._check_cancelled()
             login(page)
 
+            # ── 2. ЧИТАЕМ СТАРУЮ ЦЕНУ ─────────────────────────────────────
             self._check_cancelled()
-            open_price_modal(page, offer_id)
-            old_price = get_price_from_modal(page)
-            self._old_price_ref = old_price
-            print(f"💰 Старая цена: {old_price}₸")
+            page_price = open_price_modal(page, offer_id)
+            modal_price = get_price_from_modal(page)
+            old_price = page_price if (page_price and page_price > 0) else modal_price
+            if not old_price or old_price == 0:
+                old_price = None
+                print("Цена не задана, возврат не нужен")
+            else:
+                self._old_price_ref = old_price
+                print(f"💰 Старая цена: {old_price}₸")
 
+            # ── 3. СТАВИМ 100₸ ────────────────────────────────────────────
             self._check_cancelled()
             set_price_in_modal(page, 100)
-            self._price_changed = True
+            self._price_changed = True   # <-- с этого момента цену нужно вернуть
             self._current_stage = "price_set"
 
             product_link = get_product_link(page)
             self._notify_sync(
-                f"✅ Готово!\n"
-                f"💰 Цена снижена до 100₸\n\n"
+                f"✅ Готово! Цена снижена до 100 ₸\n\n"
                 f"🔗 Ссылка для клиента:\n{product_link}\n\n"
-                f"⏳ Жду появления заказа...\n\n"
-                f"_Для отмены: «отмени отзыв» или /cancel_"
+                f"⏳ Жду появления заказа...\n"
+                f"Для отмены — «отмени отзыв» или /cancel"
             )
 
+            # ── 4. ЖДЁМ ЗАКАЗ ─────────────────────────────────────────────
             self._check_cancelled()
             order = self._wait_for_order_cancellable(page)
 
@@ -117,19 +169,21 @@ class ReviewSession:
             if not order:
                 self._notify_sync(
                     "⏰ Заказ не появился за отведённое время.\n"
-                    "🔁 Возвращаю цену..."
+                    "Возвращаю цену..."
                 )
                 return  # finally вернёт цену
 
+            # ── 5. ПОДТВЕРЖДЕНИЕ ЗАКАЗА ───────────────────────────────────
             self._current_stage = "order_found"
             order_type = "🏪 Самовывоз" if order.get("type") == "pickup" else "🚚 Доставка"
+            print(f"🆔 Заказ найден: №{order['order_id']}, клиент: {order['customer']}, тип: {order_type}")
             self._notify_sync(
                 f"📦 Найден заказ!\n"
                 f"{order_type}\n"
                 f"👤 Клиент: {order['customer']}\n"
                 f"🆔 Заказ №: {order['order_id']}\n\n"
-                f"Это твой клиент? Ответь *да* или *нет*\n\n"
-                f"_Для отмены: «отмени отзыв»_"
+                f"Это твой клиент?",
+                reply_markup=CONFIRM_KB,
             )
 
             confirm = self._wait_from_bot(
@@ -142,26 +196,29 @@ class ReviewSession:
                 raise _CancelledByUser()
 
             if confirm != "yes":
-                self._notify_sync("❌ Клиент не подтверждён.\n🔁 Возвращаю цену...")
+                self._notify_sync("❌ Клиент не подтверждён. Возвращаю цену...")
                 return  # finally вернёт цену
 
+            # ── 6. ОТПРАВЛЯЕМ SMS ─────────────────────────────────────────
             self._check_cancelled()
             send_sms_for_delivery(page, order["order_id"])
             self._current_stage = "sms_sent"
             self._notify_sync(
                 "📲 SMS отправлен клиенту!\n\n"
-                "Введи *4-значный код* из SMS клиента, без ошибок\n\n"
-
+                "Введи 4-значный код из SMS:\n"
+                "просто цифры, например: 1234\n\n"
                 "⚠️ На этом этапе отмена невозможна — нужно завершить выдачу"
             )
 
-            # код мог прийти раньше, чем мы дошли до этого этапа — очередь буферизует
+            # ── 7. ЖДЁМ SMS-КОД ───────────────────────────────────────────
+            # Если мастер написал код ДО этого момента — он уже в очереди, берём сразу
             sms_code = self._wait_from_bot(
                 self.sms_code_queue,
                 timeout=SMS_TIMEOUT,
                 timeout_msg="SMS-кода"
             )
 
+            # Если пришёл sentinel (попытка отмены) — всё равно нужен код
             while sms_code is _CANCEL_SENTINEL:
                 self._notify_sync(
                     "⚠️ SMS уже отправлен — отмена невозможна!\n"
@@ -173,67 +230,81 @@ class ReviewSession:
                     timeout_msg="SMS-кода (после попытки отмены)"
                 )
 
+            # ── 8. ПОДТВЕРЖДАЕМ ВЫДАЧУ ────────────────────────────────────
             confirm_delivery(page, sms_code)
             self._current_stage = "done"
 
+            # ── 9. ВОЗВРАЩАЕМ ЦЕНУ ────────────────────────────────────────
+            # Делаем явно здесь (в finally тоже будет попытка — это нормально)
             success = self._safe_restore_price(page, offer_id, old_price)
             if success:
                 self._price_changed = False  # снимаем флаг — возврат уже сделан
                 self._notify_sync(
-                    "🎉 *Заказ подтверждён!*\n"
-                    "✅ Цена возвращена.\n\n"
+                    "🎉 Заказ выдан! Цена возвращена.\n\n"
                     "⏳ Генерирую варианты отзыва..."
                 )
             else:
-                self._notify_sync("🎉 Заказ подтверждён! Генерирую отзыв...")
+                # finally попробует ещё раз
+                self._notify_sync("🎉 Заказ выдан! Генерирую отзыв...")
 
+            # ── 🔟 ГЕНЕРИРУЕМ ОТЗЫВЫ ──────────────────────────────────────
             self._generate_and_send_reviews()
 
         except _CancelledByUser:
             if self._price_changed:
                 self._notify_sync(
                     f"🚫 Сессия отменена.\n"
-                    f"📍 Статус: {self._stage_description()}\n\n"
-                    f"🔁 Возвращаю цену..."
+                    f"Возвращаю цену..."
                 )
             else:
                 self._notify_sync("🚫 Отменено. Цена не была изменена.")
 
         except _TimeoutWaiting as e:
             self._notify_sync(
-                f"⏰ Таймаут: не получил {e}.\n"
-                f"🔁 Возвращаю цену..."
+                f"⏰ Время ожидания вышло: {e}.\n"
+                f"Возвращаю цену..."
             )
 
         except Exception as e:
             print(f"❌ Flow error: {e}")
             self._notify_sync(
-                f"❌ Произошла ошибка: {e}\n"
-                f"🔁 Пробую вернуть цену..."
+                f"❌ Ошибка: {e}\n"
+                f"Пробую вернуть цену..."
             )
 
         finally:
+            # ГАРАНТИРОВАННЫЙ ВОЗВРАТ — выполняется при ЛЮБОМ выходе
             if self._price_changed and old_price is not None:
                 success = self._safe_restore_price(page, offer_id, old_price)
                 if success:
                     self._price_changed = False
-                    self._notify_sync(f"✅ Цена возвращена: {old_price}₸")
+                    self._notify_sync(f"✅ Цена возвращена: {old_price} ₸")
                 else:
+                    # Все 3 попытки провалились — отправляем данные для ручного возврата
                     self._notify_sync(
-                        f"🚨 *ВНИМАНИЕ! Не удалось вернуть цену автоматически!*\n\n"
-                        f"Верни вручную в Kaspi Merchant Cabinet:\n"
-                        f"📦 offer\\_id: `{offer_id}`\n"
-                        f"💰 Цена должна быть: *{old_price}₸*\n\n"
-                        f"🔗 https://kaspi.kz/mc/#/offer/{offer_id}"
+                        f"🚨 ВНИМАНИЕ! Не удалось вернуть цену автоматически!\n\n"
+                        f"Верни вручную в Kaspi Merchant:\n"
+                        f"Offer ID: {offer_id}\n"
+                        f"Цена должна быть: {old_price} ₸\n\n"
+                        f"https://kaspi.kz/mc/#/offer/{offer_id}"
                     )
 
+    # ──────────────────────────────────────────────────────────────────────
+    # НАДЁЖНЫЙ ВОЗВРАТ ЦЕНЫ
+    # ──────────────────────────────────────────────────────────────────────
+
     def _safe_restore_price(self, page, offer_id: str, old_price: int) -> bool:
+        """
+        3 попытки вернуть цену с проверкой результата.
+        Возвращает True если цена успешно восстановлена.
+        """
         for attempt in range(1, RESTORE_ATTEMPTS + 1):
             try:
                 print(f"🔁 Возврат цены, попытка {attempt}/{RESTORE_ATTEMPTS}...")
                 open_price_modal(page, offer_id)
                 set_price_in_modal(page, old_price)
 
+                # Верифицируем — открываем модалку снова и проверяем
                 open_price_modal(page, offer_id)
                 current_price = get_price_from_modal(page)
 
@@ -253,6 +324,7 @@ class ReviewSession:
         return False
 
     def _restore_price_new_browser(self, offer_id: str, old_price: int):
+        """Резервный метод: новый браузер + логин + возврат цены."""
         try:
             print("🔄 Открываю новый браузер для возврата цены...")
             with sync_playwright() as p:
@@ -267,23 +339,27 @@ class ReviewSession:
 
             if success:
                 self._price_changed = False
-                self._notify_sync(f"✅ Цена возвращена через новый сеанс: {old_price}₸")
+                self._notify_sync(f"✅ Цена возвращена через новый сеанс: {old_price} ₸")
             else:
                 self._notify_sync(
-                    f"🚨 *КРИТИЧНО! Верни цену вручную!*\n\n"
-                    f"📦 offer\\_id: `{offer_id}`\n"
-                    f"💰 Цена должна быть: *{old_price}₸*\n\n"
-                    f"🔗 https://kaspi.kz/mc/#/offer/{offer_id}"
+                    f"🚨 КРИТИЧНО! Верни цену вручную!\n\n"
+                    f"Offer ID: {offer_id}\n"
+                    f"Цена должна быть: {old_price} ₸\n\n"
+                    f"https://kaspi.kz/mc/#/offer/{offer_id}"
                 )
 
         except Exception as e:
             print(f"❌ Новый браузер тоже упал: {e}")
             self._notify_sync(
-                f"🚨 *КРИТИЧНО! Верни цену вручную немедленно!*\n\n"
-                f"📦 offer\\_id: `{offer_id}`\n"
-                f"💰 Цена должна быть: *{old_price}₸*\n\n"
-                f"🔗 https://kaspi.kz/mc/#/offer/{offer_id}"
+                f"🚨 КРИТИЧНО! Верни цену вручную немедленно!\n\n"
+                f"Offer ID: {offer_id}\n"
+                f"Цена должна быть: {old_price} ₸\n\n"
+                f"https://kaspi.kz/mc/#/offer/{offer_id}"
             )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # ГЕНЕРАЦИЯ ОТЗЫВОВ
+    # ──────────────────────────────────────────────────────────────────────
 
     def _generate_and_send_reviews(self):
         try:
@@ -314,16 +390,20 @@ class ReviewSession:
             return
 
         lines = [
-            "📝 *Варианты отзыва для клиента:*\n",
-            "_Покажи клиенту — пусть выберет и скопирует_\n",
+            "📝 Варианты отзыва для клиента:\n",
+            "Покажи клиенту — пусть выберет и скопирует\n",
         ]
         for r in reviews:
-            lines.append(f"*{r['label']}:*")
-            lines.append(f"```\n{r['text']}\n```")
+            lines.append(f"{r['label']}:")
+            lines.append(r['text'])
             lines.append("")
 
-        lines.append("✅ Клиент оставляет отзыв: Kaspi → Мои заказы → Оценить")
+        lines.append("✅ Как оставить отзыв: Kaspi → Мои заказы → Оценить")
         await self.notify(self.user_id, "\n".join(lines))
+
+    # ──────────────────────────────────────────────────────────────────────
+    # HELPERS
+    # ──────────────────────────────────────────────────────────────────────
 
     def _check_cancelled(self):
         if self._cancel_event.is_set():
@@ -385,9 +465,9 @@ class ReviewSession:
         except Exception:
             raise _TimeoutWaiting(timeout_msg)
 
-    def _notify_sync(self, text: str):
+    def _notify_sync(self, text: str, reply_markup=None):
         future = asyncio.run_coroutine_threadsafe(
-            self.notify(self.user_id, text), self.loop
+            self.notify(self.user_id, text, reply_markup), self.loop
         )
         try:
             future.result(timeout=15)
